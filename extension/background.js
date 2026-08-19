@@ -222,7 +222,11 @@ async function buildEnqueuePayload(url, filename) {
 
 async function queueDownloadFromLink(url, filename) {
   const payload = await buildEnqueuePayload(url, filename);
-  return sendToHelper(payload);
+  const response = await sendToHelper(payload);
+  if (response?.ok === false) {
+    throw new Error(response.message || "Download request was rejected by the helper.");
+  }
+  return response;
 }
 
 async function listJobs() {
@@ -292,6 +296,32 @@ function isProbablyDirectMediaURL(url = "") {
   return /\.(mp4|m4v|webm|mkv|mov|mp3|m4a|aac|flac|wav|ogg|m3u8|mpd)(\?|$)/.test(lowered);
 }
 
+function isSupportedPageVideoURL(url = "") {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    if (host === "youtu.be" || host === "youtube.com" || host.endsWith(".youtube.com")) {
+      return true;
+    }
+    return false;
+  } catch (_) {
+    return false;
+  }
+}
+
+function getUnsupportedURLMessage(url = "") {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    if (host) {
+      return `This site is not supported yet (${host}). Right now Robot Downloader works with direct media links, HLS/DASH manifests, and YouTube video pages.`;
+    }
+  } catch (_) {
+    // ignore
+  }
+  return "This link is not supported yet. Right now Robot Downloader works with direct media links, HLS/DASH manifests, and YouTube video pages.";
+}
+
 function rememberMediaRequest(tabId, url) {
   if (typeof tabId !== "number" || tabId < 0 || !url) return;
   recentMediaByTab.set(tabId, {
@@ -332,8 +362,22 @@ browser.contextMenus.onClicked.addListener(async (info, tab) => {
     }
   }
 
-  if (info.menuItemId !== "robot-download-with-helper" || !targetURL || String(targetURL).startsWith("blob:")) {
-    await notify("Robot Downloader", "Could not find a direct media URL yet. Try playing the video for a moment, then try again.");
+  if (info.menuItemId !== "robot-download-with-helper") {
+    return;
+  }
+
+  if ((!targetURL || String(targetURL).startsWith("blob:")) && tab?.url && isSupportedPageVideoURL(tab.url)) {
+    targetURL = tab.url;
+    filename = filename || deriveFilenameFromContext({ srcUrl: tab.url });
+  }
+
+  if (!targetURL || String(targetURL).startsWith("blob:")) {
+    await notify("Robot Downloader", "Could not find a playable media URL yet. Try playing the video for a moment, then try again.");
+    return;
+  }
+
+  if (!isProbablyDirectMediaURL(targetURL) && !isSupportedPageVideoURL(targetURL)) {
+    await notify("Robot Downloader", getUnsupportedURLMessage(targetURL));
     return;
   }
 
@@ -409,10 +453,22 @@ browser.runtime.onMessage.addListener((message, sender) => {
       }
     }
 
+    if ((!targetURL || String(targetURL).startsWith("blob:")) && isSupportedPageVideoURL(message.pageURL || "")) {
+      targetURL = message.pageURL;
+      filename = filename || deriveFilenameFromContext({ srcUrl: message.pageURL });
+    }
+
     if (!targetURL || String(targetURL).startsWith("blob:")) {
       return Promise.resolve({
         ok: false,
-        message: "Could not find a direct media URL yet. Play the video for a moment, then try again.",
+        message: "Could not find a playable media URL yet. Play the video for a moment, then try again.",
+      });
+    }
+
+    if (!isProbablyDirectMediaURL(targetURL) && !isSupportedPageVideoURL(targetURL)) {
+      return Promise.resolve({
+        ok: false,
+        message: getUnsupportedURLMessage(targetURL),
       });
     }
 
@@ -421,6 +477,9 @@ browser.runtime.onMessage.addListener((message, sender) => {
       jobId: result.jobId,
       status: result.status,
       message: result.message || `Queued ${targetURL}`,
+    })).catch((error) => ({
+      ok: false,
+      message: String(error?.message || error),
     }));
   }
 

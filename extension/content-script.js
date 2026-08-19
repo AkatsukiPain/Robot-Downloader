@@ -52,7 +52,8 @@
       if (!activeVideo) return;
 
       const payload = getVideoPayload(activeVideo);
-      if (!payload.url) {
+      const effectiveURL = payload.url || payload.sourceURL || (isKnownPageBackedVideoHost(location.href) ? location.href : "");
+      if (!effectiveURL) {
         button.textContent = "Direct video URL not available";
         setTimeout(() => {
           button.textContent = "Download with Robot Downloader";
@@ -65,8 +66,9 @@
       try {
         const response = await browser.runtime.sendMessage({
           type: "enqueue-job",
-          url: payload.url,
+          url: effectiveURL,
           filename: payload.filename,
+          pageURL: payload.pageURL,
         });
         button.textContent = response?.message || (response?.ok === false ? "Need direct media URL" : "Queued");
       } catch (error) {
@@ -108,6 +110,15 @@
       pageURL: location.href,
       frameURL: location.href,
     };
+  }
+
+  function isKnownPageBackedVideoHost(url) {
+    try {
+      const host = new URL(url, location.href).hostname.toLowerCase();
+      return host === "youtube.com" || host.endsWith(".youtube.com") || host === "youtu.be";
+    } catch (_) {
+      return false;
+    }
   }
 
   function positionButton(video) {

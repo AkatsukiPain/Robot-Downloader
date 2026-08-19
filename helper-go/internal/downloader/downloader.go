@@ -1,9 +1,11 @@
 package downloader
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -42,6 +44,17 @@ type probeResult struct {
 	ETag               string
 	ContentType        string
 	ContentDisposition string
+	Extractor          string
+	RequestHeaders     map[string]string
+}
+
+type ytDLPProbe struct {
+	URL         string            `json:"url"`
+	WebpageURL  string            `json:"webpage_url"`
+	Title       string            `json:"title"`
+	Ext         string            `json:"ext"`
+	Protocol    string            `json:"protocol"`
+	HTTPHeaders map[string]string `json:"http_headers"`
 }
 
 func NewService(cfg config.Config) *Service {
@@ -280,6 +293,9 @@ func (s *Service) startQueuedJob(parentCtx context.Context, req api.EnqueueReque
 	job.ContentDisposition = probe.ContentDisposition
 	job.ETag = probe.ETag
 	job.RequestHeaders = sanitizeHeaders(mergedHeaders)
+	if len(probe.RequestHeaders) > 0 {
+		job.RequestHeaders = sanitizeHeaders(probe.RequestHeaders)
+	}
 	job.StreamKind = detectStreamKind(probe.FinalURL, probe.ContentType)
 	job.Chunks = planChunks(probe.TotalBytes, job.ChunkSizeBytes, job.MaxConnections, probe.AcceptRanges)
 	job.LastError = ""
@@ -389,7 +405,7 @@ func (s *Service) RemoveJob(jobID string) error {
 	jobFile := filepath.Join(s.cfg.JobsDir, fmt.Sprintf("%s.json", jobID))
 	if err := os.Remove(jobFile); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
-		}
+	}
 	return nil
 }
 
@@ -412,6 +428,14 @@ func (s *Service) ResumeIncomplete(ctx context.Context) error {
 
 func (s *Service) probeURL(ctx context.Context, rawURL, requestedFilename string, headers map[string]string) (probeResult, error) {
 	result := probeResult{}
+
+	if shouldUseExtractor(rawURL) {
+		extractorProbe, err := s.probeWithExtractor(ctx, rawURL, requestedFilename, headers)
+		if err != nil {
+			return probeResult{}, err
+		}
+		return extractorProbe, nil
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, rawURL, nil)
 	if err != nil {
@@ -476,6 +500,120 @@ func buildProbeResult(resp *http.Response, rawURL, requestedFilename string) pro
 		ETag:               resp.Header.Get("ETag"),
 		ContentType:        resp.Header.Get("Content-Type"),
 		ContentDisposition: contentDisposition,
+	}
+}
+
+func (s *Service) probeWithExtractor(ctx context.Context, rawURL, requestedFilename string, headers map[string]string) (probeResult, error) {
+	if !shouldUseExtractor(rawURL) {
+		return probeResult{}, errors.New("extractor not needed")
+	}
+
+	payload, err := runYTDLP(ctx, rawURL, headers)
+	if err != nil {
+		return probeResult{}, err
+	}
+
+	finalURL := strings.TrimSpace(payload.URL)
+	if finalURL == "" {
+		return probeResult{}, errors.New("yt-dlp did not return a media URL")
+	}
+
+	filename := chooseFilename(requestedFilename, "", finalURL)
+	if strings.TrimSpace(requestedFilename) == "" {
+		filename = chooseFilename(guessExtractorFilename(payload), "", finalURL)
+	}
+
+	mergedHeaders := sanitizeHeaders(headers)
+	if mergedHeaders == nil {
+		mergedHeaders = make(map[string]string)
+	}
+	for key, value := range sanitizeHeaders(payload.HTTPHeaders) {
+		if _, exists := mergedHeaders[key]; !exists {
+			mergedHeaders[key] = value
+		}
+	}
+
+	return probeResult{
+		FinalURL:       finalURL,
+		Filename:       filename,
+		AcceptRanges:   true,
+		ContentType:    guessContentTypeFromExtractor(payload),
+		Extractor:      "yt-dlp",
+		RequestHeaders: mergedHeaders,
+	}, nil
+}
+
+func shouldUseExtractor(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	return host == "youtu.be" || host == "youtube.com" || strings.HasSuffix(host, ".youtube.com")
+}
+
+func runYTDLP(ctx context.Context, rawURL string, headers map[string]string) (ytDLPProbe, error) {
+	payload := ytDLPProbe{}
+	args := []string{"-J", "--no-playlist", "-f", "best[protocol!=mhtml]/best", rawURL}
+	for key, value := range sanitizeHeaders(headers) {
+		switch {
+		case strings.EqualFold(key, "User-Agent"):
+			args = append(args, "--user-agent", value)
+		case strings.EqualFold(key, "Referer"):
+			args = append(args, "--referer", value)
+		case strings.EqualFold(key, "Cookie"):
+			args = append(args, "--add-header", fmt.Sprintf("Cookie:%s", value))
+		default:
+			args = append(args, "--add-header", fmt.Sprintf("%s:%s", key, value))
+		}
+	}
+
+	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		message := strings.TrimSpace(stderr.String())
+		if message == "" {
+			message = err.Error()
+		}
+		if errors.Is(err, exec.ErrNotFound) {
+			return payload, errors.New("YouTube download support requires yt-dlp, but it is not installed")
+		}
+		return payload, fmt.Errorf("Could not extract a downloadable stream from this YouTube page: %s", message)
+	}
+
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		return payload, fmt.Errorf("failed to decode yt-dlp output: %w", err)
+	}
+	return payload, nil
+}
+
+func guessExtractorFilename(payload ytDLPProbe) string {
+	title := sanitizeFilename(strings.TrimSpace(payload.Title))
+	ext := strings.TrimSpace(payload.Ext)
+	if title == "" {
+		title = fmt.Sprintf("video-%d", time.Now().UTC().Unix())
+	}
+	if ext != "" && !strings.HasSuffix(strings.ToLower(title), "."+strings.ToLower(ext)) {
+		return title + "." + ext
+	}
+	return title
+}
+
+func guessContentTypeFromExtractor(payload ytDLPProbe) string {
+	switch strings.ToLower(strings.TrimSpace(payload.Ext)) {
+	case "mp4", "m4v":
+		return "video/mp4"
+	case "webm":
+		return "video/webm"
+	case "mp3":
+		return "audio/mpeg"
+	case "m4a":
+		return "audio/mp4"
+	default:
+		return ""
 	}
 }
 

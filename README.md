@@ -82,6 +82,7 @@ Robot Downloader uses **Firefox Native Messaging** so the extension can talk to 
 5. **The helper manages the actual download lifecycle**
    The Go service then:
    - probes the URL
+   - extracts supported page-backed media when needed (currently YouTube via `yt-dlp`)
    - checks range support
    - creates a chunk plan
    - downloads pieces concurrently
@@ -201,7 +202,8 @@ This script detects video elements in web pages and shows a floating:
 button on hovered videos.
 
 When clicked, it sends an `enqueue-job` message back to the background script with:
-- direct media URL
+- direct media URL when available
+- a supported page URL fallback when the site needs extraction (currently YouTube)
 - guessed filename
 - page/frame context
 
@@ -280,6 +282,7 @@ The real download engine.
 
 Current responsibilities include:
 - URL probing
+- site-specific extraction for supported page-backed media (currently YouTube via `yt-dlp`)
 - `HEAD` / range fallback behavior
 - chunk planning
 - concurrent chunk download workers
@@ -300,6 +303,8 @@ Current responsibilities include:
 - helper merges completed chunks into final output
 - popup UI can list and manage jobs
 - content script can surface direct video downloads from page media elements
+- YouTube video pages can be downloaded through helper-side `yt-dlp` extraction
+- unsupported pages now return clearer user-facing messages instead of the generic “play video and try again” fallback
 
 ## Current message flow example
 
@@ -344,6 +349,8 @@ Typical helper response:
 
 - **Firefox** for the extension
 - **Go 1.23+** for building the helper
+- **yt-dlp** for supported page-based extractors such as YouTube
+- **ffmpeg** for manifest/stream copying and some extractor-backed media flows
 - a Linux/macOS environment for the provided native-host install path/script
 - permission to install a Firefox native messaging manifest in your home directory
 
@@ -377,7 +384,9 @@ Suggested test flow:
 - load the extension
 - confirm the helper is installed
 - open the popup
-- queue a test download
+- queue a direct media test download
+- queue a YouTube page download
+- try one unsupported site/page and confirm the error message is clear
 - verify jobs appear in the popup
 - verify output files are written under `~/.robot-downloader/downloads/`
 
@@ -424,6 +433,8 @@ This makes the project easier to maintain as features grow.
 ## Security notes
 
 The extension can collect cookies and request headers to help reproduce browser-authenticated downloads. That is powerful and should be treated carefully.
+
+If you enable extractor-based page downloads like YouTube, the helper may pass selected browser-derived headers to external tools such as `yt-dlp` so the extracted media request behaves like the browser session.
 
 Recommended precautions:
 - keep Native Messaging host access limited to your extension ID

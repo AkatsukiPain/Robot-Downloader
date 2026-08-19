@@ -6,11 +6,18 @@ Native Go downloader engine for Robot Downloader.
 
 - receives download jobs from the Firefox extension over Native Messaging
 - probes URLs
+- extracts supported page-based media when needed (currently YouTube via `yt-dlp`)
 - plans chunks
 - downloads files concurrently
 - persists chunk/job state on disk
 - resumes incomplete downloads on startup
 - merges finished chunks into final files
+
+## Requirements
+
+- Go 1.23+
+- `yt-dlp` for supported page-based extractors such as YouTube
+- `ffmpeg` for manifest/stream downloads and some extractor-backed flows
 
 ## Install Native Messaging host (Firefox)
 
@@ -38,12 +45,12 @@ The helper stores data under:
 Incoming messages:
 - `enqueue`
 - `list`
+- `open-location`
+- `resume-job`
+- `cancel-job`
+- `remove-job`
 
-Planned next protocol actions:
-- `pause`
-- `resume`
-- `cancel`
-- `status`
+The helper can now return clearer failures for unsupported page types and for extractor failures such as missing `yt-dlp`.
 
 ## Build manually
 
