@@ -1,0 +1,40 @@
+{
+  "manifest_version": 2,
+  "name": "Robot Downloader",
+  "version": "0.2.0",
+  "description": "Firefox extension frontend for a native Go-based downloader helper.",
+  "permissions": [
+    "downloads",
+    "storage",
+    "notifications",
+    "contextMenus",
+    "nativeMessaging",
+    "cookies",
+    "tabs",
+    "webRequest",
+    "<all_urls>"
+  ],
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content-script.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "browser_action": {
+    "default_title": "Robot Downloader",
+    "default_popup": "popup.html"
+  },
+  "icons": {
+    "48": "assets/icon.svg"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "robot-downloader@pain.local"
+    }
+  }
+}

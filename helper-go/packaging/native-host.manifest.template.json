@@ -1,0 +1,9 @@
+{
+  "name": "robot.downloader",
+  "description": "Robot Downloader native messaging host",
+  "path": "__HELPER_BINARY_PATH__",
+  "type": "stdio",
+  "allowed_extensions": [
+    "robot-downloader@pain.local"
+  ]
+}

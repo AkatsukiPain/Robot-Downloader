@@ -1,0 +1,7 @@
+# Build outputs
+helper-go/bin/
+
+# Editor / OS files
+.DS_Store
+Thumbs.db
+*.log
