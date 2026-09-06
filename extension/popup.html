@@ -7,76 +7,62 @@
   <link rel="stylesheet" href="popup.css" />
 </head>
 <body>
-  <main class="app">
-    <section class="panel compact-toolbar">
-      <div class="hero-actions hero-actions-inline">
-        <button id="themeToggleButton" class="button secondary">Dark theme</button>
-        <button id="refreshButton" class="button secondary">Refresh</button>
-      </div>
-    </section>
-
-    <section class="panel panel-stack">
-      <div class="panel-title-row">
-        <h2>Jobs</h2>
-        <span id="jobCount" class="pill">0</span>
-      </div>
-      <div id="jobsContainer" class="jobs empty">No jobs yet.</div>
-    </section>
-
+  <main class="app bridge-app">
     <section class="panel panel-stack">
       <div class="panel-title-row">
         <div>
-          <h2>Overview</h2>
-          <p class="muted small">At-a-glance download queue state</p>
+          <h2>Robot Downloader Bridge</h2>
+          <p class="muted small">Firefox catches media/page events. The local app owns the queue and UX.</p>
         </div>
-        <label class="toggle-row auto-refresh-toggle">
-          <input id="autoRefreshInput" type="checkbox" checked />
-          <span>Auto refresh</span>
-        </label>
       </div>
-      <div class="stat-grid stat-grid-4">
+
+      <div class="stat-grid stat-grid-compact">
         <article class="stat-card">
-          <span class="stat-label">Total</span>
-          <strong id="summaryTotal">0</strong>
-        </article>
-        <article class="stat-card">
-          <span class="stat-label">Active</span>
-          <strong id="summaryActive">0</strong>
-        </article>
-        <article class="stat-card">
-          <span class="stat-label">Done</span>
-          <strong id="summaryCompleted">0</strong>
-        </article>
-        <article class="stat-card">
-          <span class="stat-label">Failed</span>
-          <strong id="summaryFailed">0</strong>
+          <span class="stat-label">Bridge</span>
+          <strong id="bridgeStatus">Checking…</strong>
         </article>
       </div>
-      <div class="toolbar-grid">
+
+      <div class="actions-row wrap-actions">
+        <button id="openAppButton" class="button primary">Open downloader app</button>
+        <button id="refreshStatusButton" class="button secondary">Refresh status</button>
+      </div>
+
+      <form id="quickSendForm" class="settings-grid">
         <label>
-          Search jobs
-          <input id="searchInput" type="search" placeholder="Filename, URL, or job id" />
+          Quick-send URL
+          <input id="quickUrlInput" type="url" placeholder="https://example.com/video.mp4" />
         </label>
         <label>
-          Status filter
-          <select id="statusFilterInput">
-            <option value="all">All statuses</option>
-            <option value="downloading">Downloading</option>
-            <option value="planned">Planned</option>
-            <option value="queued">Queued</option>
-            <option value="completed">Completed</option>
-            <option value="failed">Failed</option>
+          Filename hint
+          <input id="quickFilenameInput" type="text" placeholder="Optional filename" />
+        </label>
+        <label>
+          YouTube quality
+          <select id="quickQualityInput">
+            <option value="highest">Highest available</option>
+            <option value="2160p">Up to 2160p</option>
+            <option value="1440p">Up to 1440p</option>
+            <option value="1080p">Up to 1080p</option>
+            <option value="720p">Up to 720p</option>
+            <option value="480p">Up to 480p</option>
+            <option value="360p">Up to 360p</option>
           </select>
         </label>
-      </div>
-      <p id="jobsInfoMessage" class="status muted">Showing all jobs.</p>
+        <div class="actions-row span-all wrap-actions">
+          <button type="submit" class="button primary">Send to downloader</button>
+          <button id="sendCurrentTabButton" type="button" class="button secondary">Send current tab</button>
+        </div>
+      </form>
+
+      <p id="statusMessage" class="status muted">Ready.</p>
     </section>
 
     <section class="panel panel-stack">
       <div class="panel-title-row">
         <div>
-          <h2>Settings</h2>
-          <p class="muted small">Firefox-side helper defaults</p>
+          <h2>Bridge settings</h2>
+          <p class="muted small">These defaults are only used when forwarding jobs.</p>
         </div>
       </div>
       <form id="settingsForm" class="settings-grid">
@@ -96,11 +82,23 @@
           Retry count
           <input id="retryCountInput" name="retryCount" type="number" min="0" max="10" />
         </label>
+        <label>
+          Default YouTube quality
+          <select id="youtubeQualityInput" name="youtubeQuality">
+            <option value="highest">Highest available</option>
+            <option value="2160p">Up to 2160p</option>
+            <option value="1440p">Up to 1440p</option>
+            <option value="1080p">Up to 1080p</option>
+            <option value="720p">Up to 720p</option>
+            <option value="480p">Up to 480p</option>
+            <option value="360p">Up to 360p</option>
+          </select>
+        </label>
         <label class="toggle-row span-all">
           <input id="autoInterceptInput" name="autoIntercept" type="checkbox" />
           <span>Auto-intercept Firefox downloads</span>
         </label>
-        <div class="actions-row span-all">
+        <div class="actions-row span-all wrap-actions">
           <button type="submit" class="button primary">Save settings</button>
         </div>
       </form>

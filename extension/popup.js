@@ -1,408 +1,200 @@
-const state = {
-  jobs: [],
-  autoRefresh: true,
-  autoRefreshTimer: null,
-  openingLocationFor: null,
-  resumingJobFor: null,
-  cancelingJobFor: null,
-  removingJobFor: null,
-  visibleJobLimit: 5,
-  progressSnapshots: {},
-  theme: "light",
+const DEFAULT_SETTINGS = {
+  helperName: "robot.downloader",
+  autoIntercept: false,
+  maxConnections: 8,
+  chunkSizeMb: 8,
+  retryCount: 3,
+  youtubeQuality: "highest",
 };
 
-function formatBytes(value) {
-  if (!value) return "unknown size";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let size = value;
-  let unit = 0;
-  while (size >= 1024 && unit < units.length - 1) {
-    size /= 1024;
-    unit += 1;
-  }
-  return `${size.toFixed(size >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`;
+function normalizeSettings(input = {}) {
+  const rawQuality = String(input.youtubeQuality || DEFAULT_SETTINGS.youtubeQuality).trim().toLowerCase();
+  const youtubeQuality = ["highest", "2160p", "1440p", "1080p", "720p", "480p", "360p"].includes(rawQuality)
+    ? rawQuality
+    : DEFAULT_SETTINGS.youtubeQuality;
+
+  return {
+    helperName: String(input.helperName || DEFAULT_SETTINGS.helperName).trim() || DEFAULT_SETTINGS.helperName,
+    autoIntercept: Boolean(input.autoIntercept),
+    maxConnections: Math.min(32, Math.max(1, Number.parseInt(input.maxConnections, 10) || DEFAULT_SETTINGS.maxConnections)),
+    chunkSizeMb: Math.min(256, Math.max(1, Number.parseInt(input.chunkSizeMb, 10) || DEFAULT_SETTINGS.chunkSizeMb)),
+    retryCount: Math.min(10, Math.max(0, Number.parseInt(input.retryCount, 10) || DEFAULT_SETTINGS.retryCount)),
+    youtubeQuality,
+  };
 }
 
-function formatSpeed(bytesPerSecond) {
-  if (!bytesPerSecond || bytesPerSecond <= 0) return "—";
-  return `${formatBytes(bytesPerSecond)}/s`;
+async function getSettings() {
+  const stored = await browser.storage.local.get("settings");
+  return normalizeSettings({ ...DEFAULT_SETTINGS, ...(stored.settings || {}) });
 }
 
-function formatDuration(seconds) {
-  if (!seconds || seconds <= 0 || !Number.isFinite(seconds)) return "—";
-  const totalSeconds = Math.max(1, Math.round(seconds));
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const secs = totalSeconds % 60;
-
-  if (hours > 0) return `${hours}h ${minutes}m`;
-  if (minutes > 0) return `${minutes}m ${secs}s`;
-  return `${secs}s`;
+async function saveSettings(nextSettings) {
+  const settings = normalizeSettings(nextSettings);
+  await browser.storage.local.set({ settings });
+  return settings;
 }
 
-function formatDate(value) {
-  if (!value) return "—";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "—";
-  return new Intl.DateTimeFormat(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(date);
-}
-
-function escapeHtml(value) {
-  return String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-}
-
-function applyTheme(theme) {
-  state.theme = theme === "light" ? "light" : "dark";
-  document.documentElement.setAttribute("data-theme", state.theme);
-  const button = document.getElementById("themeToggleButton");
-  if (button) {
-    button.textContent = state.theme === "light" ? "Dark theme" : "Light theme";
-  }
-}
-
-function setSettingsMessage(message, isError = false) {
-  const el = document.getElementById("settingsMessage");
+function setMessage(id, message, isError = false) {
+  const el = document.getElementById(id);
   el.textContent = message;
-  el.classList.toggle("muted", !isError);
-  el.style.color = isError ? "#fca5a5" : "";
-}
-
-function setJobsInfo(message, isError = false) {
-  const el = document.getElementById("jobsInfoMessage");
-  el.textContent = message;
-  el.classList.toggle("muted", !isError);
-  el.style.color = isError ? "#fca5a5" : "";
+  el.style.color = isError ? "#fecaca" : "";
 }
 
 function fillSettingsForm(settings) {
-  document.getElementById("helperNameInput").value = settings.helperName || "robot.downloader";
-  document.getElementById("maxConnectionsInput").value = settings.maxConnections ?? 8;
-  document.getElementById("chunkSizeInput").value = settings.chunkSizeMb ?? 8;
-  document.getElementById("retryCountInput").value = settings.retryCount ?? 3;
+  document.getElementById("helperNameInput").value = settings.helperName || DEFAULT_SETTINGS.helperName;
+  document.getElementById("maxConnectionsInput").value = settings.maxConnections ?? DEFAULT_SETTINGS.maxConnections;
+  document.getElementById("chunkSizeInput").value = settings.chunkSizeMb ?? DEFAULT_SETTINGS.chunkSizeMb;
+  document.getElementById("retryCountInput").value = settings.retryCount ?? DEFAULT_SETTINGS.retryCount;
+  document.getElementById("youtubeQualityInput").value = settings.youtubeQuality || DEFAULT_SETTINGS.youtubeQuality;
   document.getElementById("autoInterceptInput").checked = Boolean(settings.autoIntercept);
-  applyTheme(settings.theme || "light");
+  document.getElementById("quickQualityInput").value = settings.youtubeQuality || DEFAULT_SETTINGS.youtubeQuality;
 }
 
-function renderSummary(jobs) {
-  const counts = jobs.reduce((acc, job) => {
-    acc.total += 1;
-    if (job.status === "completed") acc.completed += 1;
-    else if (job.status === "failed") acc.failed += 1;
-    else if (job.status === "downloading") acc.active += 1;
-    return acc;
-  }, { total: 0, active: 0, completed: 0, failed: 0 });
-
-  document.getElementById("summaryTotal").textContent = String(counts.total);
-  document.getElementById("summaryActive").textContent = String(counts.active);
-  document.getElementById("summaryCompleted").textContent = String(counts.completed);
-  document.getElementById("summaryFailed").textContent = String(counts.failed);
-}
-
-function getFilteredJobs() {
-  const query = document.getElementById("searchInput").value.trim().toLowerCase();
-  const statusFilter = document.getElementById("statusFilterInput").value;
-
-  return state.jobs.filter((job) => {
-    const matchesStatus = statusFilter === "all" || job.status === statusFilter;
-    if (!matchesStatus) return false;
-    if (!query) return true;
-
-    const haystack = [job.filename, job.url, job.jobId, job.status]
-      .filter(Boolean)
-      .join(" ")
-      .toLowerCase();
-    return haystack.includes(query);
-  }).slice(0, state.visibleJobLimit);
-}
-
-function canOpenLocation(job) {
-  return ["completed", "downloading", "failed", "planned", "queued"].includes(job.status || "");
-}
-
-function getResumeLabel(job) {
-  if (job.status !== "failed") return "";
-  if (job.canResume) return state.resumingJobFor === job.jobId ? "Resuming…" : "Resume";
-  return "Unable to resume";
-}
-
-function canCancel(job) {
-  return ["downloading", "queued", "planned"].includes(job.status || "");
-}
-
-function getAverageSpeed(job) {
-  if ((job.status || "") !== "downloading") return 0;
-  const downloadedBytes = Number(job.downloadedBytes || 0);
-  if (downloadedBytes <= 0) return 0;
-
-  const startedAt = new Date(job.createdAt || 0).getTime();
-  const updatedAt = new Date(job.modifiedAt || 0).getTime();
-  if (!startedAt || !updatedAt || Number.isNaN(startedAt) || Number.isNaN(updatedAt) || updatedAt <= startedAt) {
-    return 0;
+async function collectCookiesForURL(url) {
+  try {
+    const target = new URL(url);
+    const candidates = [url, `${target.origin}/`];
+    const seen = new Map();
+    for (const candidate of candidates) {
+      const cookies = await browser.cookies.getAll({ url: candidate });
+      for (const cookie of cookies) {
+        seen.set(`${cookie.storeId}:${cookie.domain}:${cookie.path}:${cookie.name}`, cookie);
+      }
+    }
+    const cookies = [...seen.values()];
+    return cookies.length ? cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ") : "";
+  } catch (_) {
+    return "";
   }
-
-  const seconds = Math.max(1, Math.round((updatedAt - startedAt) / 1000));
-  return downloadedBytes / seconds;
 }
 
-function updateProgressSnapshots(jobs) {
-  const nextSnapshots = {};
-  for (const job of jobs) {
-    const previous = state.progressSnapshots[job.jobId];
-    const current = {
-      downloadedBytes: Number(job.downloadedBytes || 0),
-      modifiedAt: new Date(job.modifiedAt || 0).getTime(),
-      previous,
-    };
-    nextSnapshots[job.jobId] = current;
+function getUserAgent() {
+  try { return navigator.userAgent; } catch (_) { return "Mozilla/5.0"; }
+}
+
+function getAcceptLanguage() {
+  try {
+    const langs = navigator.languages?.filter(Boolean) || [];
+    if (langs.length) return langs.join(",");
+    return navigator.language || "en-US,en;q=0.9";
+  } catch (_) {
+    return "en-US,en;q=0.9";
   }
-  state.progressSnapshots = nextSnapshots;
 }
 
-function getLiveSpeed(job) {
-  if ((job.status || "") !== "downloading") return 0;
-  const snapshot = state.progressSnapshots[job.jobId];
-  const previous = snapshot?.previous;
-  if (snapshot && previous) {
-    const byteDelta = snapshot.downloadedBytes - previous.downloadedBytes;
-    const timeDeltaMs = snapshot.modifiedAt - previous.modifiedAt;
-    if (byteDelta > 0 && timeDeltaMs > 0) {
-      return byteDelta / (timeDeltaMs / 1000);
+async function getActiveTab() {
+  const tabs = await browser.tabs.query({ active: true, currentWindow: true });
+  return tabs[0] || null;
+}
+
+async function buildRequestContext(url, pageURL = "") {
+  const cookieHeader = await collectCookiesForURL(url);
+  const headers = {
+    "User-Agent": getUserAgent(),
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": getAcceptLanguage(),
+    "Cache-Control": "no-cache",
+    Pragma: "no-cache",
+    DNT: "1",
+    "Upgrade-Insecure-Requests": "1",
+  };
+  if (cookieHeader) headers.Cookie = cookieHeader;
+  if (pageURL) {
+    headers.Referer = pageURL;
+    try {
+      const parsed = new URL(pageURL);
+      headers.Origin = parsed.origin;
+    } catch (_) {
+      // ignore
     }
   }
-  return getAverageSpeed(job);
+  return { headers, pageURL };
 }
 
-function getRemainingBytes(job) {
-  const totalBytes = Number(job.totalBytes || 0);
-  const downloadedBytes = Number(job.downloadedBytes || 0);
-  if (totalBytes <= 0) return 0;
-  return Math.max(0, totalBytes - downloadedBytes);
+async function sendThroughHelper(message) {
+  return browser.runtime.sendMessage(message);
 }
 
-function getEtaSeconds(job, speedBytesPerSecond) {
-  const remainingBytes = getRemainingBytes(job);
-  if (remainingBytes <= 0 || !speedBytesPerSecond || speedBytesPerSecond <= 0) return 0;
-  return remainingBytes / speedBytesPerSecond;
+async function refreshBridgeStatus() {
+  try {
+    const response = await sendThroughHelper({ type: "app-health" });
+    document.getElementById("bridgeStatus").textContent = response?.ok ? "Connected" : "Unavailable";
+    setMessage("statusMessage", response?.ok ? "Downloader app is reachable." : "Downloader app is unavailable.");
+  } catch (error) {
+    document.getElementById("bridgeStatus").textContent = "Unavailable";
+    setMessage("statusMessage", String(error?.message || error), true);
+  }
 }
 
-function renderJobs(jobs) {
-  const container = document.getElementById("jobsContainer");
-  const jobCount = document.getElementById("jobCount");
-  jobCount.textContent = String(jobs.length);
+async function openDownloaderApp() {
+  const response = await sendThroughHelper({ type: "open-app" });
+  if (response?.ok === false) throw new Error(response.message || "Could not open downloader app");
+  setMessage("statusMessage", response?.message || "Opened downloader app.");
+}
 
-  if (!jobs.length) {
-    container.className = "jobs empty";
-    container.textContent = state.jobs.length ? "No jobs match the current filter." : "No jobs yet.";
+async function quickSendURL(url, filename, youtubeQuality) {
+  const settings = await getSettings();
+  const activeTab = await getActiveTab();
+  const context = await buildRequestContext(url, activeTab?.url || "");
+  const response = await sendThroughHelper({
+    type: "enqueue",
+    url,
+    filename: filename || null,
+    options: {
+      maxConnections: settings.maxConnections,
+      chunkSizeBytes: settings.chunkSizeMb * 1024 * 1024,
+      retryCount: settings.retryCount,
+      youtubeQuality: youtubeQuality || settings.youtubeQuality,
+    },
+    context,
+  });
+  if (response?.ok === false) throw new Error(response.message || "Queue failed");
+  setMessage("statusMessage", response?.message || "Sent to downloader.");
+}
+
+function isSupportedPageVideoURL(url = "") {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    if (host === "youtu.be") return true;
+    return (host === "youtube.com" || host.endsWith(".youtube.com")) && parsed.pathname === "/watch";
+  } catch (_) {
+    return false;
+  }
+}
+
+async function sendCurrentTab() {
+  const tab = await getActiveTab();
+  if (!tab?.url) throw new Error("No active tab URL found");
+  const url = tab.url;
+  if (!/^https?:/i.test(url)) throw new Error("Current tab is not a downloadable HTTP(S) page");
+  const filename = isSupportedPageVideoURL(url) ? null : (tab.title || "download").replace(/[\\/:*?"<>|]+/g, "_");
+  const quality = document.getElementById("quickQualityInput").value || DEFAULT_SETTINGS.youtubeQuality;
+  await quickSendURL(url, filename, quality);
+}
+
+document.getElementById("openAppButton").addEventListener("click", () => {
+  openDownloaderApp().catch((error) => setMessage("statusMessage", String(error?.message || error), true));
+});
+
+document.getElementById("refreshStatusButton").addEventListener("click", () => {
+  refreshBridgeStatus();
+});
+
+document.getElementById("quickSendForm").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const url = document.getElementById("quickUrlInput").value.trim();
+  const filename = document.getElementById("quickFilenameInput").value.trim();
+  const quality = document.getElementById("quickQualityInput").value;
+  if (!url) {
+    setMessage("statusMessage", "Quick-send URL is required.", true);
     return;
   }
-
-  container.className = "jobs";
-  container.innerHTML = jobs.map((job) => {
-    const totalBytes = Number(job.totalBytes || 0);
-    const downloadedBytes = Number(job.downloadedBytes || 0);
-    const safeFilename = escapeHtml(job.filename || "Unnamed file");
-    const safeURL = escapeHtml(job.url || "");
-    const status = escapeHtml(job.status || "unknown");
-    const percent = totalBytes > 0 ? Math.max(0, Math.min(100, Math.round((downloadedBytes / totalBytes) * 100))) : 0;
-    const progressLabel = totalBytes > 0
-      ? `${formatBytes(downloadedBytes)} / ${formatBytes(totalBytes)}`
-      : formatBytes(downloadedBytes || 0);
-
-    const canOpen = canOpenLocation(job);
-    const isOpening = state.openingLocationFor === job.jobId;
-    const resumeLabel = getResumeLabel(job);
-    const liveSpeed = getLiveSpeed(job);
-    const remainingBytes = getRemainingBytes(job);
-    const etaSeconds = getEtaSeconds(job, liveSpeed);
-
-    return `
-      <article class="job ${state.removingJobFor === job.jobId ? "job-removing" : ""}">
-        <div class="job-header-row">
-          <div class="job-header-main">
-            <div class="job-name">${safeFilename}</div>
-            <span class="pill status-${status}">${status}</span>
-          </div>
-          <div class="job-actions job-actions-top">
-            ${job.status === "failed" ? `
-              <button
-                type="button"
-                class="button secondary job-action-button"
-                data-action="resume-job"
-                data-job-id="${escapeHtml(job.jobId || "")}"${job.canResume ? "" : " disabled"}
-                title="${escapeHtml(job.canResume ? "Resume this failed job" : (job.resumeReason || "This job cannot be resumed"))}"
-              >${escapeHtml(resumeLabel)}</button>
-            ` : ""}
-            ${canCancel(job) ? `
-              <button
-                type="button"
-                class="button secondary job-action-button"
-                data-action="cancel-job"
-                data-job-id="${escapeHtml(job.jobId || "")}"
-              >${state.cancelingJobFor === job.jobId ? "Canceling…" : "Cancel"}</button>
-            ` : ""}
-            <button
-              type="button"
-              class="button secondary job-action-button"
-              data-action="open-location"
-              data-job-id="${escapeHtml(job.jobId || "")}"${canOpen ? "" : " disabled"}
-            >${isOpening ? "Opening…" : "Open location"}</button>
-            <button
-              type="button"
-              class="button secondary job-action-button danger-button"
-              data-action="remove-job"
-              data-job-id="${escapeHtml(job.jobId || "")}"
-            >${state.removingJobFor === job.jobId ? "Removing…" : "Remove"}</button>
-          </div>
-        </div>
-        <div class="job-subrow">
-          <div class="job-time">Updated ${escapeHtml(formatDate(job.modifiedAt))}</div>
-          <div class="job-time">Created ${escapeHtml(formatDate(job.createdAt))}</div>
-        </div>
-        <div class="job-url">${safeURL}</div>
-        <div class="job-progress-row">
-          <span class="job-time">${escapeHtml(progressLabel)}</span>
-          <span class="job-time">${totalBytes > 0 ? `${percent}%` : "live"}</span>
-        </div>
-        <div class="job-progress-track" aria-hidden="true">
-          <div class="job-progress-bar" style="width: ${percent}%;"></div>
-        </div>
-        <div class="job-meta">
-          <span class="pill">Range support: ${job.acceptRanges ? "Yes" : "No"}</span>
-          ${job.status === "downloading" ? `<span class="pill">Speed: ${escapeHtml(formatSpeed(liveSpeed))}</span>` : ""}
-          ${job.status === "downloading" && remainingBytes > 0 ? `<span class="pill">Remaining: ${escapeHtml(formatBytes(remainingBytes))}</span>` : ""}
-          ${job.status === "downloading" && etaSeconds > 0 ? `<span class="pill">ETA: ${escapeHtml(formatDuration(etaSeconds))}</span>` : ""}
-          <span class="pill">Job ID: ${escapeHtml(job.jobId || "-")}</span>
-        </div>
-      </article>`;
-  }).join("");
-}
-
-function refreshDerivedViews() {
-  renderSummary(state.jobs);
-  const filtered = getFilteredJobs();
-  renderJobs(filtered);
-
-  if (!state.jobs.length) {
-    setJobsInfo("No jobs yet.");
-    return;
-  }
-
-  const hasQuery = document.getElementById("searchInput").value.trim().length > 0;
-  const statusFilter = document.getElementById("statusFilterInput").value;
-  const isFiltered = hasQuery || statusFilter !== "all";
-  const baseCount = isFiltered
-    ? state.jobs.filter((job) => {
-        const matchesStatus = statusFilter === "all" || job.status === statusFilter;
-        if (!matchesStatus) return false;
-        if (!hasQuery) return true;
-        const haystack = [job.filename, job.url, job.jobId, job.status]
-          .filter(Boolean)
-          .join(" ")
-          .toLowerCase();
-        return haystack.includes(document.getElementById("searchInput").value.trim().toLowerCase());
-      }).length
-    : state.jobs.length;
-
-  if (baseCount > state.visibleJobLimit) {
-    setJobsInfo(`Showing the latest ${filtered.length} of ${baseCount} matching job(s).`);
-    return;
-  }
-
-  setJobsInfo(
-    isFiltered
-      ? `Showing ${filtered.length} matching job(s).`
-      : `Showing the latest ${filtered.length} job(s).`
-  );
-}
-
-async function loadJobs() {
-  try {
-    const response = await browser.runtime.sendMessage({ type: "get-jobs" });
-    state.jobs = response.jobs || [];
-    updateProgressSnapshots(state.jobs);
-    refreshDerivedViews();
-  } catch (error) {
-    setJobsInfo("Could not load jobs.", true);
-  }
-}
-
-async function loadSettings() {
-  try {
-    const response = await browser.runtime.sendMessage({ type: "get-settings" });
-    fillSettingsForm(response.settings || {});
-    setSettingsMessage("Settings loaded.");
-  } catch (error) {
-    setSettingsMessage(String(error), true);
-  }
-}
-
-async function refreshAll() {
-  await Promise.all([loadJobs(), loadSettings()]);
-}
-
-function stopAutoRefresh() {
-  if (state.autoRefreshTimer) {
-    clearInterval(state.autoRefreshTimer);
-    state.autoRefreshTimer = null;
-  }
-}
-
-function startAutoRefresh() {
-  stopAutoRefresh();
-  if (!state.autoRefresh) return;
-  state.autoRefreshTimer = setInterval(() => {
-    Promise.all([loadJobs()]).catch(() => {});
-  }, 1000);
-}
-
-document.getElementById("refreshButton").addEventListener("click", () => {
-  refreshAll();
+  quickSendURL(url, filename, quality).catch((error) => setMessage("statusMessage", String(error?.message || error), true));
 });
 
-document.getElementById("themeToggleButton").addEventListener("click", async () => {
-  const nextTheme = state.theme === "light" ? "dark" : "light";
-  applyTheme(nextTheme);
-
-  try {
-    const response = await browser.runtime.sendMessage({
-      type: "save-settings",
-      settings: {
-        helperName: document.getElementById("helperNameInput").value.trim(),
-        maxConnections: document.getElementById("maxConnectionsInput").value,
-        chunkSizeMb: document.getElementById("chunkSizeInput").value,
-        retryCount: document.getElementById("retryCountInput").value,
-        autoIntercept: document.getElementById("autoInterceptInput").checked,
-        theme: nextTheme,
-      },
-    });
-    fillSettingsForm(response.settings || { theme: nextTheme });
-  } catch (error) {
-    setJobsInfo(String(error), true);
-  }
-});
-
-document.getElementById("searchInput").addEventListener("input", () => {
-  refreshDerivedViews();
-});
-
-document.getElementById("statusFilterInput").addEventListener("change", () => {
-  refreshDerivedViews();
-});
-
-document.getElementById("autoRefreshInput").addEventListener("change", (event) => {
-  state.autoRefresh = Boolean(event.target.checked);
-  startAutoRefresh();
-  setJobsInfo(state.autoRefresh ? "Auto refresh enabled." : "Auto refresh paused.");
+document.getElementById("sendCurrentTabButton").addEventListener("click", () => {
+  sendCurrentTab().catch((error) => setMessage("statusMessage", String(error?.message || error), true));
 });
 
 document.getElementById("settingsForm").addEventListener("submit", async (event) => {
@@ -412,102 +204,25 @@ document.getElementById("settingsForm").addEventListener("submit", async (event)
     maxConnections: document.getElementById("maxConnectionsInput").value,
     chunkSizeMb: document.getElementById("chunkSizeInput").value,
     retryCount: document.getElementById("retryCountInput").value,
+    youtubeQuality: document.getElementById("youtubeQualityInput").value,
     autoIntercept: document.getElementById("autoInterceptInput").checked,
-    theme: state.theme,
   };
-
   try {
-    const response = await browser.runtime.sendMessage({ type: "save-settings", settings });
-    fillSettingsForm(response.settings || settings);
-    setSettingsMessage("Settings saved.");
+    const saved = await saveSettings(settings);
+    fillSettingsForm(saved);
+    setMessage("settingsMessage", "Bridge settings saved.");
   } catch (error) {
-    setSettingsMessage(String(error), true);
+    setMessage("settingsMessage", String(error?.message || error), true);
   }
 });
 
-document.getElementById("jobsContainer").addEventListener("click", async (event) => {
-  const button = event.target.closest("[data-action]");
-  if (!button) return;
-
-  const action = button.dataset.action;
-  const jobId = button.dataset.jobId;
-  if (!jobId) return;
-
-  if (action === "open-location") {
-    state.openingLocationFor = jobId;
-    refreshDerivedViews();
-    setJobsInfo("Opening file location...");
-
-    try {
-      const response = await browser.runtime.sendMessage({ type: "open-job-location", jobId });
-      setJobsInfo(response.message || "Opened file location.");
-    } catch (error) {
-      setJobsInfo(String(error), true);
-    } finally {
-      state.openingLocationFor = null;
-      refreshDerivedViews();
-    }
-    return;
+(async function boot() {
+  try {
+    const settings = await getSettings();
+    fillSettingsForm(settings);
+    setMessage("settingsMessage", "Settings loaded.");
+  } catch (error) {
+    setMessage("settingsMessage", String(error?.message || error), true);
   }
-
-  if (action === "resume-job") {
-    state.resumingJobFor = jobId;
-    refreshDerivedViews();
-    setJobsInfo("Resuming failed job...");
-
-    try {
-      const response = await browser.runtime.sendMessage({ type: "resume-job", jobId });
-      setJobsInfo(response.message || "Resuming job.");
-      await loadJobs();
-    } catch (error) {
-      setJobsInfo(String(error), true);
-    } finally {
-      state.resumingJobFor = null;
-      refreshDerivedViews();
-    }
-    return;
-  }
-
-  if (action === "cancel-job") {
-    state.cancelingJobFor = jobId;
-    refreshDerivedViews();
-    setJobsInfo("Canceling job...");
-
-    try {
-      const response = await browser.runtime.sendMessage({ type: "cancel-job", jobId });
-      setJobsInfo(response.message || "Canceled job.");
-      await loadJobs();
-    } catch (error) {
-      setJobsInfo(String(error), true);
-    } finally {
-      state.cancelingJobFor = null;
-      refreshDerivedViews();
-    }
-    return;
-  }
-
-  if (action === "remove-job") {
-    state.removingJobFor = jobId;
-    refreshDerivedViews();
-    setJobsInfo("Removing job and data...");
-
-    try {
-      const response = await browser.runtime.sendMessage({ type: "remove-job", jobId });
-      setJobsInfo(response.message || "Removed job and data.");
-      await new Promise((resolve) => setTimeout(resolve, 220));
-      await loadJobs();
-    } catch (error) {
-      setJobsInfo(String(error), true);
-    } finally {
-      state.removingJobFor = null;
-      refreshDerivedViews();
-    }
-  }
-});
-
-window.addEventListener("unload", () => {
-  stopAutoRefresh();
-});
-
-refreshAll();
-startAutoRefresh();
+  await refreshBridgeStatus();
+})();

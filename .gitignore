@@ -1,5 +1,7 @@
 # Build outputs
 helper-go/bin/
+helper-go/downloader
+sample.txt
 
 # Editor / OS files
 .DS_Store

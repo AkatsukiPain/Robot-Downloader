@@ -5,7 +5,7 @@ Robot Downloader is a split download system with two parts working together:
 - `extension/` — a Firefox WebExtension that lives in the browser
 - `helper-go/` — a native Go helper that does the real download work
 
-The extension is intentionally lightweight. It handles browser UX, user actions, and request collection. The Go helper is the download engine: it receives jobs, downloads files in chunks, persists state on disk, resumes interrupted work, and manages files outside the browser sandbox.
+The extension is intentionally lightweight. It now acts mainly as a browser event catcher and bridge. The Go helper runs a local downloader daemon plus app UI on localhost: it receives jobs, downloads files in chunks, persists state on disk, resumes interrupted work, and manages files outside the browser sandbox.
 
 ## Why the project is split
 
@@ -32,8 +32,8 @@ The native helper is better suited for:
 
 That split is the core design of Robot Downloader:
 
-- **extension = control plane / browser UX**
-- **helper = data plane / downloader engine**
+- **extension = thin browser bridge / event catcher**
+- **helper = local daemon + downloader engine + app UI**
 
 ## How extension and helper collaborate
 
@@ -42,7 +42,7 @@ Robot Downloader uses **Firefox Native Messaging** so the extension can talk to 
 ### End-to-end workflow
 
 1. **The user starts a download in Firefox**
-   - from the extension popup
+   - from the extension icon (opens the helper app)
    - from the context menu
    - from the floating video button injected by the content script
    - or via download interception when enabled
@@ -105,7 +105,7 @@ Firefox page / media
         │
         ▼
 content-script.js
-  (detects media, shows action button)
+  (detects media, shows download button with quality selector)
         │
         ▼
 background.js
@@ -124,6 +124,56 @@ internal/downloader + storage + jobstate
         ├── ~/.robot-downloader/chunks/
         └── ~/.robot-downloader/downloads/
 ```
+
+## Local app UI
+
+The helper serves a local downloader app at:
+
+- `http://127.0.0.1:38519/app/`
+
+That app is the primary UX for:
+- queue inspection
+- progress and status
+- opening folders
+- resume/cancel/remove
+- pasting URLs directly into the downloader
+
+The Firefox extension icon now opens this app directly (no popup).
+
+## How to use
+
+### Downloading videos on YouTube
+
+1. Open any YouTube video page
+2. Look at the player controls bar (bottom of the video) — you'll see a **download icon** (downward arrow) with a **quality dropdown** next to it, alongside the settings/CC/fullscreen buttons
+3. Select your desired quality from the dropdown:
+   - **Auto (best)** — picks the highest available resolution
+   - **Up to 2160p** / **1440p** / **1080p** / **720p** / **480p** / **360p** — caps at your choice
+4. Click the download icon to queue the video
+5. The helper app (at `http://127.0.0.1:38519/app/`) will show progress
+
+### Downloading videos on other sites
+
+1. Hover over any video on the page
+2. A floating **Download** button with a quality selector appears at the top-left of the video
+3. Pick your quality and click to download
+4. The button stays visible as long as the video is on screen
+
+### Using the extension icon
+
+- **Click the extension icon** → opens the helper app UI directly
+- **Right-click the extension icon** → context menu options for quick actions
+
+### Context menu
+
+Right-click on any link or page and use:
+- **Download with Robot Downloader** — sends the URL to the helper
+
+### File management
+
+- All downloads go to `~/.robot-downloader/downloads/`
+- Open the helper app to manage, resume, cancel, or remove jobs
+- Use the "Open file location" button in the app to find your files
 
 ## Repository structure
 
@@ -171,7 +221,6 @@ Defines the Firefox extension:
 - permissions
 - background script
 - content script
-- popup
 - native messaging permission
 - Gecko extension ID
 
@@ -196,30 +245,20 @@ Current responsibilities include:
 This file should stay orchestration-focused. It should not become a downloader engine.
 
 ### `extension/content-script.js`
-This script detects video elements in web pages and shows a floating:
-- **Download with Robot Downloader**
+This script detects video elements in web pages and shows:
 
-button on hovered videos.
+- **On YouTube:** a download button with quality dropdown injected directly into the player controls bar (always visible)
+- **On other sites:** a floating Download button with quality selector at the top-left of the video (always visible on the largest video)
 
 When clicked, it sends an `enqueue-job` message back to the background script with:
+- the page URL (for YouTube, which needs extraction)
 - direct media URL when available
-- a supported page URL fallback when the site needs extraction (currently YouTube)
 - guessed filename
+- selected quality
 - page/frame context
 
 ### `extension/popup.js`
-The popup is the main management UI inside Firefox.
-
-Current responsibilities include:
-- rendering job summaries
-- filtering/searching jobs
-- showing progress, speed, ETA, and status
-- saving settings
-- opening file locations
-- resuming failed jobs
-- canceling active jobs
-- removing jobs
-- toggling theme
+Currently unused — the extension icon opens the helper app directly.
 
 ## Helper side
 
@@ -303,8 +342,10 @@ Current responsibilities include:
 - helper merges completed chunks into final output
 - popup UI can list and manage jobs
 - content script can surface direct video downloads from page media elements
-- YouTube video pages can be downloaded through helper-side `yt-dlp` extraction
-- unsupported pages now return clearer user-facing messages instead of the generic “play video and try again” fallback
+- **YouTube video pages** have a dedicated download button with quality selector in the player controls bar
+- **Non-YouTube videos** get a persistent floating download button at the top-left of the video
+- **Quality selection** includes Auto (best), 2160p, 1440p, 1080p, 720p, 480p, 360p
+- unsupported pages now return clearer user-facing messages
 
 ## Current message flow example
 
@@ -383,11 +424,9 @@ Temporary development install:
 Suggested test flow:
 - load the extension
 - confirm the helper is installed
-- open the popup
-- queue a direct media test download
-- queue a YouTube page download
-- try one unsupported site/page and confirm the error message is clear
-- verify jobs appear in the popup
+- open a YouTube video and look for the download button in the player controls
+- hover over a video on another site and see the floating button
+- queue a download and verify the helper app shows progress
 - verify output files are written under `~/.robot-downloader/downloads/`
 
 ## Supported platforms

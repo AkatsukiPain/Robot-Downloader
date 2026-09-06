@@ -1,6 +1,7 @@
 package downloader
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -15,6 +16,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,12 +31,34 @@ import (
 
 const defaultUserAgent = "RobotDownloader/0.1"
 
+var ytDLPProgressRE = regexp.MustCompile(`\[download\]\s+([0-9]+(?:\.[0-9]+)?)%\s+of\s+~?([0-9.]+[KMGTP]?i?B)(?:\s+at\s+(.+?))?(?:\s+ETA\s+([^\s]+))?$`)
+
 type Service struct {
 	cfg        config.Config
 	store      *storage.JobStore
 	httpClient *http.Client
 	mu         sync.Mutex
 	cancels    map[string]context.CancelFunc
+}
+
+func debugLog(format string, args ...any) {
+	logPath := filepath.Join(os.TempDir(), "robot-downloader-helper.log")
+	line := fmt.Sprintf("[%s] %s\n", time.Now().Format(time.RFC3339), fmt.Sprintf(format, args...))
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = f.WriteString(line)
+}
+
+func headerKeys(headers map[string]string) []string {
+	keys := make([]string, 0, len(headers))
+	for key := range headers {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 type probeResult struct {
@@ -84,6 +109,7 @@ func (s *Service) Enqueue(ctx context.Context, req api.EnqueueRequest) (jobstate
 	job := jobstate.Job{
 		JobID:           jobID,
 		URL:             req.URL,
+		OriginalURL:     req.URL,
 		Filename:        filename,
 		Status:          "queued",
 		CreatedAt:       now,
@@ -93,8 +119,11 @@ func (s *Service) Enqueue(ctx context.Context, req api.EnqueueRequest) (jobstate
 		MaxConnections:  options.MaxConnections,
 		ChunkSizeBytes:  options.ChunkSizeBytes,
 		RetryCount:      options.RetryCount,
+		YouTubeQuality:  options.YouTubeQuality,
 		DownloadedBytes: 0,
 		RequestHeaders:  sanitizeHeaders(mergedHeaders),
+		OriginalHeaders: sanitizeHeaders(mergedHeaders),
+		OriginalPageURL: req.Context.PageURL,
 		Chunks:          []jobstate.ChunkState{{Index: 0, Start: 0, End: -1, Completed: false, BytesSaved: 0}},
 	}
 
@@ -108,6 +137,9 @@ func (s *Service) Enqueue(ctx context.Context, req api.EnqueueRequest) (jobstate
 }
 
 func (s *Service) Download(ctx context.Context, job *jobstate.Job) error {
+	if job.Extractor == "yt-dlp" {
+		return s.downloadWithYTDLP(ctx, job)
+	}
 	if isStreamManifestURL(job.URL, job.ContentType) {
 		return s.downloadStream(ctx, job)
 	}
@@ -273,7 +305,20 @@ func (s *Service) startQueuedJob(parentCtx context.Context, req api.EnqueueReque
 	}()
 
 	mergedHeaders := enrichHeadersWithContext(req.URL, req.Context.PageURL, req.Context.Headers)
+	job.Status = "probing"
+	job.ModifiedAt = time.Now().UTC()
+	job.LastError = ""
+	job.OriginalHeaders = sanitizeHeaders(mergedHeaders)
+	if strings.TrimSpace(req.Context.PageURL) != "" {
+		job.OriginalPageURL = req.Context.PageURL
+	}
+	if strings.TrimSpace(req.URL) != "" {
+		job.OriginalURL = req.URL
+	}
+	_ = s.store.Save(job)
+	debugLog("startQueuedJob job=%s requestedURL=%s referer=%s headerKeys=%v", job.JobID, req.URL, mergedHeaders["Referer"], headerKeys(mergedHeaders))
 	probe, err := s.probeURL(parentCtx, req.URL, req.Filename, mergedHeaders)
+	debugLog("probe result job=%s finalURL=%s extractor=%s contentType=%s acceptRanges=%v requestHeaderKeys=%v err=%v", job.JobID, probe.FinalURL, probe.Extractor, probe.ContentType, probe.AcceptRanges, headerKeys(probe.RequestHeaders), err)
 	if err != nil {
 		job.Status = "failed"
 		job.LastError = err.Error()
@@ -285,6 +330,9 @@ func (s *Service) startQueuedJob(parentCtx context.Context, req api.EnqueueReque
 	job.URL = probe.FinalURL
 	job.Filename = ensureStreamFriendlyFilename(probe.FinalURL, probe.Filename, probe.ContentType)
 	job.Status = initialStatusForProbe(probe)
+	if probe.Extractor == "yt-dlp" {
+		job.Status = "extracting"
+	}
 	job.ModifiedAt = time.Now().UTC()
 	job.OutputPath = filepath.Join(s.cfg.DownloadsDir, job.Filename)
 	job.TotalBytes = probe.TotalBytes
@@ -297,6 +345,8 @@ func (s *Service) startQueuedJob(parentCtx context.Context, req api.EnqueueReque
 		job.RequestHeaders = sanitizeHeaders(probe.RequestHeaders)
 	}
 	job.StreamKind = detectStreamKind(probe.FinalURL, probe.ContentType)
+	job.Extractor = probe.Extractor
+	job.ExtractorSourceURL = preferredExtractorURL(req.URL, mergedHeaders)
 	job.Chunks = planChunks(probe.TotalBytes, job.ChunkSizeBytes, job.MaxConnections, probe.AcceptRanges)
 	job.LastError = ""
 	if err := s.store.Save(job); err != nil {
@@ -350,7 +400,19 @@ func (s *Service) ResumeJob(ctx context.Context, jobID string) (jobstate.Job, er
 		return job, err
 	}
 
-	go s.startQueuedJob(ctx, api.EnqueueRequest{URL: job.URL, Filename: job.Filename, Options: api.DownloadOptions{MaxConnections: job.MaxConnections, ChunkSizeBytes: job.ChunkSizeBytes, RetryCount: job.RetryCount}, Context: api.RequestContext{Headers: job.RequestHeaders}}, job)
+	reqURL := job.URL
+	reqHeaders := job.RequestHeaders
+	pageURL := ""
+	if len(job.OriginalHeaders) > 0 {
+		reqHeaders = job.OriginalHeaders
+	}
+	if strings.TrimSpace(job.OriginalPageURL) != "" {
+		pageURL = job.OriginalPageURL
+	}
+	if strings.TrimSpace(job.OriginalURL) != "" {
+		reqURL = job.OriginalURL
+	}
+	go s.startQueuedJob(ctx, api.EnqueueRequest{URL: reqURL, Filename: job.Filename, Options: api.DownloadOptions{MaxConnections: job.MaxConnections, ChunkSizeBytes: job.ChunkSizeBytes, RetryCount: job.RetryCount, YouTubeQuality: job.YouTubeQuality}, Context: api.RequestContext{Headers: reqHeaders, PageURL: pageURL}}, job)
 
 	return job, nil
 }
@@ -419,9 +481,19 @@ func (s *Service) ResumeIncomplete(ctx context.Context) error {
 		if job.Status == "completed" {
 			continue
 		}
-		if err := s.Download(ctx, &job); err != nil {
-			continue
+		reqURL := job.URL
+		reqHeaders := job.RequestHeaders
+		pageURL := ""
+		if len(job.OriginalHeaders) > 0 {
+			reqHeaders = job.OriginalHeaders
 		}
+		if strings.TrimSpace(job.OriginalPageURL) != "" {
+			pageURL = job.OriginalPageURL
+		}
+		if strings.TrimSpace(job.OriginalURL) != "" {
+			reqURL = job.OriginalURL
+		}
+		go s.startQueuedJob(ctx, api.EnqueueRequest{URL: reqURL, Filename: job.Filename, Options: api.DownloadOptions{MaxConnections: job.MaxConnections, ChunkSizeBytes: job.ChunkSizeBytes, RetryCount: job.RetryCount, YouTubeQuality: job.YouTubeQuality}, Context: api.RequestContext{Headers: reqHeaders, PageURL: pageURL}}, job)
 	}
 	return nil
 }
@@ -429,8 +501,9 @@ func (s *Service) ResumeIncomplete(ctx context.Context) error {
 func (s *Service) probeURL(ctx context.Context, rawURL, requestedFilename string, headers map[string]string) (probeResult, error) {
 	result := probeResult{}
 
-	if shouldUseExtractor(rawURL) {
-		extractorProbe, err := s.probeWithExtractor(ctx, rawURL, requestedFilename, headers)
+	extractorURL := preferredExtractorURL(rawURL, headers)
+	if shouldUseExtractor(extractorURL) {
+		extractorProbe, err := s.probeWithExtractor(ctx, extractorURL, requestedFilename, headers)
 		if err != nil {
 			return probeResult{}, err
 		}
@@ -518,19 +591,26 @@ func (s *Service) probeWithExtractor(ctx context.Context, rawURL, requestedFilen
 		return probeResult{}, errors.New("yt-dlp did not return a media URL")
 	}
 
-	filename := chooseFilename(requestedFilename, "", finalURL)
-	if strings.TrimSpace(requestedFilename) == "" {
-		filename = chooseFilename(guessExtractorFilename(payload), "", finalURL)
+	filename := chooseFilename(guessExtractorFilename(payload), "", finalURL)
+	if strings.TrimSpace(requestedFilename) != "" {
+		filename = chooseFilename(requestedFilename, "", finalURL)
 	}
 
-	mergedHeaders := sanitizeHeaders(headers)
+	mergedHeaders := sanitizeHeaders(payload.HTTPHeaders)
 	if mergedHeaders == nil {
 		mergedHeaders = make(map[string]string)
 	}
-	for key, value := range sanitizeHeaders(payload.HTTPHeaders) {
-		if _, exists := mergedHeaders[key]; !exists {
-			mergedHeaders[key] = value
-		}
+	if ua := strings.TrimSpace(headers["User-Agent"]); ua != "" {
+		mergedHeaders["User-Agent"] = ua
+	}
+	if ua := strings.TrimSpace(headers["user-agent"]); ua != "" {
+		mergedHeaders["User-Agent"] = ua
+	}
+	if payload.WebpageURL != "" {
+		mergedHeaders["Referer"] = payload.WebpageURL
+	}
+	if strings.TrimSpace(mergedHeaders["Accept"]) == "" {
+		mergedHeaders["Accept"] = "*/*"
 	}
 
 	return probeResult{
@@ -552,42 +632,93 @@ func shouldUseExtractor(rawURL string) bool {
 	return host == "youtu.be" || host == "youtube.com" || strings.HasSuffix(host, ".youtube.com")
 }
 
+func preferredExtractorURL(rawURL string, headers map[string]string) string {
+	referer := strings.TrimSpace(headers["Referer"])
+	if referer == "" {
+		referer = strings.TrimSpace(headers["referer"])
+	}
+	if referer == "" {
+		return rawURL
+	}
+
+	parsedRaw, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	if !strings.HasSuffix(strings.ToLower(parsedRaw.Hostname()), ".googlevideo.com") {
+		return rawURL
+	}
+	if shouldUseExtractor(referer) {
+		return referer
+	}
+	return rawURL
+}
+
 func runYTDLP(ctx context.Context, rawURL string, headers map[string]string) (ytDLPProbe, error) {
 	payload := ytDLPProbe{}
-	args := []string{"-J", "--no-playlist", "-f", "best[protocol!=mhtml]/best", rawURL}
+	baseArgs := []string{"-J", "--no-playlist", "--js-runtimes", "node", "--remote-components", "ejs:github", "-f", "best[protocol!=mhtml]/best"}
+	baseWithCookies := append([]string{}, baseArgs...)
+	baseWithCookies = append(baseWithCookies, "--cookies-from-browser", "firefox")
+	debugLog("yt-dlp probe rawURL=%s incomingHeaderKeys=%v", rawURL, headerKeys(headers))
 	for key, value := range sanitizeHeaders(headers) {
 		switch {
 		case strings.EqualFold(key, "User-Agent"):
-			args = append(args, "--user-agent", value)
+			baseArgs = append(baseArgs, "--user-agent", value)
+			baseWithCookies = append(baseWithCookies, "--user-agent", value)
 		case strings.EqualFold(key, "Referer"):
-			args = append(args, "--referer", value)
+			baseArgs = append(baseArgs, "--referer", value)
+			baseWithCookies = append(baseWithCookies, "--referer", value)
 		case strings.EqualFold(key, "Cookie"):
-			args = append(args, "--add-header", fmt.Sprintf("Cookie:%s", value))
+			continue
+		case strings.EqualFold(key, "Origin"):
+			continue
+		case len(value) > 2048:
+			continue
 		default:
-			args = append(args, "--add-header", fmt.Sprintf("%s:%s", key, value))
+			baseArgs = append(baseArgs, "--add-header", fmt.Sprintf("%s:%s", key, value))
+			baseWithCookies = append(baseWithCookies, "--add-header", fmt.Sprintf("%s:%s", key, value))
 		}
 	}
 
-	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		message := strings.TrimSpace(stderr.String())
-		if message == "" {
-			message = err.Error()
-		}
-		if errors.Is(err, exec.ErrNotFound) {
-			return payload, errors.New("YouTube download support requires yt-dlp, but it is not installed")
-		}
-		return payload, fmt.Errorf("Could not extract a downloadable stream from this YouTube page: %s", message)
+	attempts := [][]string{
+		append(append([]string{}, baseWithCookies...), rawURL),
+		append(append([]string{}, baseWithCookies...), "--extractor-args", "youtube:player_client=web", rawURL),
+		append(append([]string{}, baseWithCookies...), "--extractor-args", "youtube:player_client=tv_embedded", rawURL),
+		append(append([]string{}, baseArgs...), "--extractor-args", "youtube:player_client=android", rawURL),
 	}
 
-	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
-		return payload, fmt.Errorf("failed to decode yt-dlp output: %w", err)
+	var lastErr string
+	for index, args := range attempts {
+		cmd := exec.CommandContext(ctx, "yt-dlp", args...)
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			message := strings.TrimSpace(stderr.String())
+			if message == "" {
+				message = err.Error()
+			}
+			if errors.Is(err, exec.ErrNotFound) {
+				return payload, errors.New("YouTube download support requires yt-dlp, but it is not installed")
+			}
+			lastErr = message
+			debugLog("yt-dlp probe failed rawURL=%s attempt=%d error=%s", rawURL, index+1, message)
+			continue
+		}
+		if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+			lastErr = fmt.Sprintf("failed to decode yt-dlp output: %v", err)
+			debugLog("yt-dlp probe decode failed rawURL=%s attempt=%d error=%v", rawURL, index+1, err)
+			continue
+		}
+		debugLog("yt-dlp probe success rawURL=%s attempt=%d webpageURL=%s mediaURL=%s httpHeaderKeys=%v", rawURL, index+1, payload.WebpageURL, payload.URL, headerKeys(payload.HTTPHeaders))
+		return payload, nil
 	}
-	return payload, nil
+
+	if lastErr == "" {
+		lastErr = "unknown yt-dlp probe failure"
+	}
+	return payload, fmt.Errorf("Could not extract a downloadable stream from this YouTube page: %s", lastErr)
 }
 
 func guessExtractorFilename(payload ytDLPProbe) string {
@@ -669,6 +800,7 @@ func (s *Service) downloadChunk(ctx context.Context, job jobstate.Job, chunkInde
 		return 0, err
 	}
 	applyHeaders(req, job.RequestHeaders)
+	debugLog("downloadChunk job=%s chunk=%d url=%s headerKeys=%v range=%s", job.JobID, chunkIndex, job.URL, headerKeys(job.RequestHeaders), req.Header.Get("Range"))
 
 	start := chunk.Start + existingSize
 	end := chunk.End
@@ -683,6 +815,7 @@ func (s *Service) downloadChunk(ctx context.Context, job jobstate.Job, chunkInde
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
+		debugLog("downloadChunk failure job=%s chunk=%d status=%s responseHeaders=%v", job.JobID, chunkIndex, resp.Status, headerKeys(mapFromHeader(resp.Header)))
 		return existingSize, fmt.Errorf("download failed with status %s", resp.Status)
 	}
 	if job.AcceptRanges && end >= 0 && resp.StatusCode != http.StatusPartialContent {
@@ -753,9 +886,21 @@ func (s *Service) downloadStream(ctx context.Context, job *jobstate.Job) error {
 	args = append(args, "-i", job.URL, "-c", "copy", job.OutputPath)
 
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer devNull.Close()
+	cmd.Stdout = devNull
+	cmd.Stderr = devNull
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("ffmpeg failed: %w", err)
 	}
+
+	job.Status = "merging"
+	job.ModifiedAt = time.Now().UTC()
+	job.LastError = ""
+	_ = s.store.Save(*job)
 
 	if updated, _ := s.refreshLiveJobState(*job); true {
 		job.DownloadedBytes = updated.DownloadedBytes
@@ -767,19 +912,238 @@ func (s *Service) downloadStream(ctx context.Context, job *jobstate.Job) error {
 	return s.store.Save(*job)
 }
 
+func (s *Service) downloadWithYTDLP(ctx context.Context, job *jobstate.Job) error {
+	job.Status = "extracting"
+	job.ModifiedAt = time.Now().UTC()
+	job.LastError = ""
+	if err := s.store.Save(*job); err != nil {
+		return err
+	}
+	if err := ensureDir(filepath.Dir(job.OutputPath)); err != nil {
+		return err
+	}
+
+	sourceURL := strings.TrimSpace(job.ExtractorSourceURL)
+	if sourceURL == "" {
+		sourceURL = strings.TrimSpace(job.RequestHeaders["Referer"])
+	}
+	if sourceURL == "" {
+		sourceURL = job.URL
+	}
+
+	baseArgs := []string{"--newline", "--js-runtimes", "node", "--remote-components", "ejs:github", "--downloader", "ffmpeg", "--http-chunk-size", "10M", "--no-part", "--retries", "10", "-o", job.OutputPath}
+	baseWithCookies := append([]string{}, baseArgs...)
+	baseWithCookies = append(baseWithCookies, "--cookies-from-browser", "firefox")
+	preferredFormat := youtubeFormatSelector(job.YouTubeQuality)
+	for key, value := range sanitizeHeaders(job.RequestHeaders) {
+		switch {
+		case strings.EqualFold(key, "User-Agent"):
+			baseArgs = append(baseArgs, "--user-agent", value)
+			baseWithCookies = append(baseWithCookies, "--user-agent", value)
+		case strings.EqualFold(key, "Referer"):
+			baseArgs = append(baseArgs, "--referer", value)
+			baseWithCookies = append(baseWithCookies, "--referer", value)
+		case strings.EqualFold(key, "Cookie"):
+			continue
+		case strings.EqualFold(key, "Origin"):
+			continue
+		case len(value) > 2048:
+			continue
+		default:
+			baseArgs = append(baseArgs, "--add-header", fmt.Sprintf("%s:%s", key, value))
+			baseWithCookies = append(baseWithCookies, "--add-header", fmt.Sprintf("%s:%s", key, value))
+		}
+	}
+
+	playlistArgs := []string{"--no-playlist"}
+	if shouldUseExtractor(sourceURL) {
+		playlistArgs = append(playlistArgs, "--playlist-items", "1")
+	}
+
+	attempts := [][]string{
+		append(append(append([]string{}, baseWithCookies...), playlistArgs...), "-f", preferredFormat, "--merge-output-format", "mp4", sourceURL),
+		append(append(append([]string{}, baseWithCookies...), playlistArgs...), "--extractor-args", "youtube:player_client=web", "-f", preferredFormat, "--merge-output-format", "mp4", sourceURL),
+		append(append(append([]string{}, baseWithCookies...), playlistArgs...), "--extractor-args", "youtube:player_client=tv_embedded", "-f", preferredFormat, "--merge-output-format", "mp4", sourceURL),
+		append(append(append([]string{}, baseArgs...), playlistArgs...), "--extractor-args", "youtube:player_client=android", "-f", preferredFormat, "--merge-output-format", "mp4", sourceURL),
+		append(append(append([]string{}, baseWithCookies...), playlistArgs...), "-f", qualityCappedProgressiveSelector(job.YouTubeQuality), sourceURL),
+		append(append(append([]string{}, baseArgs...), playlistArgs...), "--extractor-args", "youtube:player_client=android", "-f", qualityCappedProgressiveSelector(job.YouTubeQuality), sourceURL),
+		append(append(append([]string{}, baseWithCookies...), playlistArgs...), "-f", "best", sourceURL),
+		append(append(append([]string{}, baseArgs...), playlistArgs...), "-f", "best", sourceURL),
+	}
+
+	var lastErr string
+	for index, args := range attempts {
+		job.Status = "downloading"
+		job.ModifiedAt = time.Now().UTC()
+		job.LastError = ""
+		_ = s.store.Save(*job)
+		debugLog("yt-dlp download job=%s attempt=%d sourceURL=%s output=%s args=%v", job.JobID, index+1, sourceURL, job.OutputPath, args)
+		_ = os.Remove(job.OutputPath)
+		cmd := exec.CommandContext(ctx, "yt-dlp", args...)
+		stdoutPipe, err := cmd.StdoutPipe()
+		if err != nil {
+			return err
+		}
+		stderrPipe, err := cmd.StderrPipe()
+		if err != nil {
+			return err
+		}
+		var stderr bytes.Buffer
+		if err := cmd.Start(); err != nil {
+			return err
+		}
+		progressDone := make(chan struct{})
+		go func() {
+			defer close(progressDone)
+			lines := make(chan string, 64)
+			var wg sync.WaitGroup
+			consume := func(r io.Reader) {
+				defer wg.Done()
+				reader := bufio.NewReader(r)
+				for {
+					line, readErr := reader.ReadString('\n')
+					if line != "" {
+						lines <- line
+					}
+					if readErr != nil {
+						return
+					}
+				}
+			}
+			wg.Add(2)
+			go consume(stdoutPipe)
+			go consume(stderrPipe)
+			go func() {
+				wg.Wait()
+				close(lines)
+			}()
+			for line := range lines {
+				stderr.WriteString(line)
+				debugLog("yt-dlp progress job=%s line=%q", job.JobID, strings.TrimSpace(line))
+				s.updateYTDLPProgress(job, line)
+			}
+		}()
+		err = cmd.Wait()
+		<-progressDone
+		if err == nil {
+			job.ProgressPercent = 100
+			job.ProgressText = "100%"
+			job.SpeedText = ""
+			job.ETAText = ""
+			if info, statErr := os.Stat(job.OutputPath); statErr == nil {
+				job.DownloadedBytes = info.Size()
+				job.TotalBytes = info.Size()
+			}
+			job.Status = "completed"
+			job.ModifiedAt = time.Now().UTC()
+			job.LastError = ""
+			return s.store.Save(*job)
+		}
+		job.ProgressText = ""
+		job.SpeedText = ""
+		job.ETAText = ""
+		job.ProgressPercent = 0
+		_ = s.store.Save(*job)
+		lastErr = strings.TrimSpace(stderr.String())
+		if lastErr == "" {
+			lastErr = "yt-dlp execution failed"
+		}
+		debugLog("yt-dlp download failed job=%s attempt=%d error=%s", job.JobID, index+1, lastErr)
+	}
+
+	return fmt.Errorf("yt-dlp download failed: %s", lastErr)
+}
+
 func (s *Service) refreshLiveJobState(job jobstate.Job) (jobstate.Job, bool) {
 	changed := false
-	if job.Status == "downloading" && job.StreamKind != "" && strings.TrimSpace(job.OutputPath) != "" {
+	if job.Status == "downloading" && strings.TrimSpace(job.OutputPath) != "" {
 		if info, err := os.Stat(job.OutputPath); err == nil {
 			if info.Size() != job.DownloadedBytes {
 				job.DownloadedBytes = info.Size()
-				job.TotalBytes = max64(job.TotalBytes, info.Size())
+				if job.Extractor != "yt-dlp" {
+					job.TotalBytes = max64(job.TotalBytes, info.Size())
+				}
 				job.ModifiedAt = time.Now().UTC()
 				changed = true
 			}
 		}
 	}
 	return job, changed
+}
+
+func (s *Service) updateYTDLPProgress(job *jobstate.Job, line string) {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return
+	}
+	match := ytDLPProgressRE.FindStringSubmatch(line)
+	if len(match) == 0 {
+		ffmpegMatch := regexp.MustCompile(`time=([0-9:.]+)`).FindStringSubmatch(line)
+		if len(ffmpegMatch) > 1 {
+			job.ProgressText = ffmpegMatch[1]
+			job.ModifiedAt = time.Now().UTC()
+			_ = s.store.Save(*job)
+		}
+		return
+	}
+	percent, err := strconv.ParseFloat(match[1], 64)
+	if err != nil {
+		return
+	}
+	job.ProgressPercent = percent
+	job.ProgressText = strings.TrimSpace(match[1]) + "%"
+	if totalBytes, ok := parseHumanBytes(match[2]); ok {
+		job.TotalBytes = totalBytes
+		job.DownloadedBytes = int64((percent / 100) * float64(totalBytes))
+	}
+	if len(match) > 3 {
+		job.SpeedText = strings.TrimSpace(match[3])
+	}
+	if len(match) > 4 {
+		job.ETAText = strings.TrimSpace(match[4])
+	}
+	job.ModifiedAt = time.Now().UTC()
+	_ = s.store.Save(*job)
+}
+
+func parseHumanBytes(value string) (int64, bool) {
+	v := strings.TrimSpace(strings.ReplaceAll(value, "~", ""))
+	if v == "" {
+		return 0, false
+	}
+	re := regexp.MustCompile(`^([0-9]+(?:\.[0-9]+)?)([KMGTP]?i?B)$`)
+	m := re.FindStringSubmatch(v)
+	if len(m) != 3 {
+		return 0, false
+	}
+	n, err := strconv.ParseFloat(m[1], 64)
+	if err != nil {
+		return 0, false
+	}
+	mul := float64(1)
+	switch m[2] {
+	case "KB":
+		mul = 1000
+	case "MB":
+		mul = 1000 * 1000
+	case "GB":
+		mul = 1000 * 1000 * 1000
+	case "TB":
+		mul = 1000 * 1000 * 1000 * 1000
+	case "KiB":
+		mul = 1024
+	case "MiB":
+		mul = 1024 * 1024
+	case "GiB":
+		mul = 1024 * 1024 * 1024
+	case "TiB":
+		mul = 1024 * 1024 * 1024 * 1024
+	case "B":
+		mul = 1
+	default:
+		return 0, false
+	}
+	return int64(n * mul), true
 }
 
 func (s *Service) syncJobWithDisk(job *jobstate.Job) error {
@@ -814,10 +1178,19 @@ func normalizeOptions(opts api.DownloadOptions) api.DownloadOptions {
 	if opts.RetryCount < 0 {
 		opts.RetryCount = 0
 	}
+	switch strings.ToLower(strings.TrimSpace(opts.YouTubeQuality)) {
+	case "highest", "best", "1080p", "720p", "480p", "360p":
+		opts.YouTubeQuality = strings.ToLower(strings.TrimSpace(opts.YouTubeQuality))
+	default:
+		opts.YouTubeQuality = "highest"
+	}
 	return opts
 }
 
 func initialStatusForProbe(probe probeResult) string {
+	if probe.Extractor == "yt-dlp" {
+		return "extracting"
+	}
 	if isStreamManifestURL(probe.FinalURL, probe.ContentType) {
 		return "planned"
 	}
@@ -891,6 +1264,48 @@ func normalizeFilename(rawURL, requested string) string {
 	}
 
 	return fmt.Sprintf("download-%d.bin", time.Now().UTC().Unix())
+}
+
+func trimForLog(value string, maxLen int) string {
+	value = strings.TrimSpace(value)
+	if maxLen <= 0 || len(value) <= maxLen {
+		return value
+	}
+	return value[:maxLen] + "..."
+}
+
+func youtubeFormatSelector(quality string) string {
+	switch strings.ToLower(strings.TrimSpace(quality)) {
+	case "360p":
+		return "bestvideo[height<=360][vcodec!=none]+bestaudio[acodec!=none]/best[height<=360]"
+	case "480p":
+		return "bestvideo[height<=480][vcodec!=none]+bestaudio[acodec!=none]/best[height<=480]"
+	case "720p":
+		return "bestvideo[height<=720][vcodec!=none]+bestaudio[acodec!=none]/best[height<=720]"
+	case "1080p":
+		return "bestvideo[height<=1080][vcodec!=none]+bestaudio[acodec!=none]/best[height<=1080]"
+	case "best", "highest", "":
+		return "bestvideo[vcodec!=none]+bestaudio[acodec!=none]/best"
+	default:
+		return "bestvideo[vcodec!=none]+bestaudio[acodec!=none]/best"
+	}
+}
+
+func qualityCappedProgressiveSelector(quality string) string {
+	switch strings.ToLower(strings.TrimSpace(quality)) {
+	case "360p":
+		return "best[height<=360][ext=mp4]/best[height<=360]/best"
+	case "480p":
+		return "best[height<=480][ext=mp4]/best[height<=480]/best"
+	case "720p":
+		return "best[height<=720][ext=mp4]/best[height<=720]/best"
+	case "1080p":
+		return "best[height<=1080][ext=mp4]/best[height<=1080]/best"
+	case "best", "highest", "":
+		return "best[ext=mp4]/best"
+	default:
+		return "best[ext=mp4]/best"
+	}
 }
 
 func detectStreamKind(rawURL, contentType string) string {
@@ -1005,6 +1420,17 @@ func fileSize(path string) (int64, error) {
 	return info.Size(), nil
 }
 
+func mapFromHeader(header http.Header) map[string]string {
+	if len(header) == 0 {
+		return nil
+	}
+	flat := make(map[string]string, len(header))
+	for key, values := range header {
+		flat[key] = strings.Join(values, ",")
+	}
+	return flat
+}
+
 func applyHeaders(req *http.Request, headers map[string]string) {
 	appliedUA := false
 	for key, value := range sanitizeHeaders(headers) {
@@ -1032,6 +1458,10 @@ func sanitizeHeaders(headers map[string]string) map[string]string {
 		if key == "" || value == "" {
 			continue
 		}
+		if strings.HasPrefix(key, "X-Robot-") {
+			clean[key] = value
+			continue
+		}
 		canonical := http.CanonicalHeaderKey(key)
 		if isBlockedRequestHeader(canonical) {
 			continue
@@ -1054,6 +1484,9 @@ func enrichHeadersWithContext(downloadURL, pageURL string, headers map[string]st
 	merged := sanitizeHeaders(headers)
 	if merged == nil {
 		merged = make(map[string]string)
+	}
+	if playbackURL := strings.TrimSpace(merged["X-Robot-YouTube-Playback-URL"]); playbackURL != "" {
+		debugLog("playback hint downloadURL=%s playbackURL=%s method=%s document=%s requestHeaders=%s responseHeaders=%s", downloadURL, playbackURL, merged["X-Robot-YouTube-Playback-Method"], merged["X-Robot-YouTube-Playback-Document"], trimForLog(merged["X-Robot-YouTube-Playback-Request-Headers"], 800), trimForLog(merged["X-Robot-YouTube-Playback-Response-Headers"], 800))
 	}
 
 	if pageURL != "" {

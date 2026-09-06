@@ -26,8 +26,7 @@
     }
   ],
   "browser_action": {
-    "default_title": "Robot Downloader",
-    "default_popup": "popup.html"
+    "default_title": "Robot Downloader"
   },
   "icons": {
     "48": "assets/icon.svg"

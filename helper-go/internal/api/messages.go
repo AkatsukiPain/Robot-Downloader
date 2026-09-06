@@ -16,9 +16,10 @@ type RequestContext struct {
 }
 
 type DownloadOptions struct {
-	MaxConnections int   `json:"maxConnections"`
-	ChunkSizeBytes int64 `json:"chunkSizeBytes"`
-	RetryCount     int   `json:"retryCount"`
+	MaxConnections int    `json:"maxConnections"`
+	ChunkSizeBytes int64  `json:"chunkSizeBytes"`
+	RetryCount     int    `json:"retryCount"`
+	YouTubeQuality string `json:"youtubeQuality,omitempty"`
 }
 
 type OpenLocationRequest struct {

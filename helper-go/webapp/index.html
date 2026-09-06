@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Robot Downloader App</title>
+  <link rel="stylesheet" href="/app/assets/app.css?v=20260823-1958">
+</head>
+<body>
+  <main>
+    <section class="header">
+      <div>
+        <h1>Robot Downloader</h1>
+        <p>The browser catches events. This local app owns the real queue, state, and controls.</p>
+      </div>
+      <div class="actions">
+        <button class="secondary" id="reloadButton">Refresh</button>
+      </div>
+    </section>
+
+    <section class="stats">
+      <article class="stat"><span class="muted">Total jobs</span><b id="totalJobs">0</b></article>
+      <article class="stat"><span class="muted">Active</span><b id="activeJobs">0</b></article>
+      <article class="stat"><span class="muted">Completed</span><b id="doneJobs">0</b></article>
+      <article class="stat"><span class="muted">Failed</span><b id="failedJobs">0</b></article>
+    </section>
+
+    <section class="row">
+      <section class="panel">
+        <h2>Queue</h2>
+        <p id="statusText" class="muted">Loading…</p>
+        <div id="jobs" class="jobs"></div>
+      </section>
+
+      <aside class="controls">
+        <section class="panel">
+          <h2>New download</h2>
+          <form id="enqueueForm" class="quick">
+            <label>URL<input id="urlInput" type="url" placeholder="https://example.com/video.mp4" required></label>
+            <label>Filename (optional)<input id="filenameInput" type="text" placeholder="video.mp4"></label>
+            <label>YouTube quality
+              <select id="qualityInput">
+                <option value="highest">Highest available</option>
+                <option value="1080p">Up to 1080p</option>
+                <option value="720p">Up to 720p</option>
+                <option value="480p">Up to 480p</option>
+                <option value="360p">Up to 360p</option>
+              </select>
+            </label>
+            <button type="submit">Queue download</button>
+          </form>
+          <div class="notice">You can paste URLs here directly, or send them from Firefox via the thin extension bridge.</div>
+        </section>
+
+        <section class="panel">
+          <h2>Bridge status</h2>
+          <div id="settingsText" class="small muted">Loading settings…</div>
+          <div class="actions section-actions">
+            <button class="secondary" id="pasteButton">Paste clipboard</button>
+          </div>
+        </section>
+      </aside>
+    </section>
+  </main>
+  <script src="/app/assets/app.js?v=20260823-1958"></script>
+</body>
+</html>

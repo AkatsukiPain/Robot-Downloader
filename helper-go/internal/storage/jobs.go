@@ -64,7 +64,9 @@ func (s *JobStore) List() ([]jobstate.Job, error) {
 
 		var job jobstate.Job
 		if err := json.Unmarshal(data, &job); err != nil {
-			return nil, err
+			corruptPath := filepath.Join(s.jobsDir, entry.Name()+".corrupt")
+			_ = os.Rename(filepath.Join(s.jobsDir, entry.Name()), corruptPath)
+			continue
 		}
 		jobs = append(jobs, job)
 	}

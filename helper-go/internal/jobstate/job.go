@@ -22,6 +22,7 @@ type Job struct {
 	MaxConnections     int               `json:"maxConnections"`
 	ChunkSizeBytes     int64             `json:"chunkSizeBytes"`
 	RetryCount         int               `json:"retryCount"`
+	YouTubeQuality     string            `json:"youtubeQuality,omitempty"`
 	TotalBytes         int64             `json:"totalBytes"`
 	DownloadedBytes    int64             `json:"downloadedBytes"`
 	AcceptRanges       bool              `json:"acceptRanges"`
@@ -29,7 +30,16 @@ type Job struct {
 	ContentDisposition string            `json:"contentDisposition,omitempty"`
 	ETag               string            `json:"etag,omitempty"`
 	RequestHeaders     map[string]string `json:"requestHeaders,omitempty"`
+	OriginalHeaders    map[string]string `json:"originalHeaders,omitempty"`
+	OriginalPageURL    string            `json:"originalPageUrl,omitempty"`
+	OriginalURL        string            `json:"originalUrl,omitempty"`
 	Chunks             []ChunkState      `json:"chunks"`
 	StreamKind         string            `json:"streamKind,omitempty"`
+	Extractor          string            `json:"extractor,omitempty"`
+	ExtractorSourceURL string            `json:"extractorSourceUrl,omitempty"`
+	ProgressPercent    float64           `json:"progressPercent,omitempty"`
+	ProgressText       string            `json:"progressText,omitempty"`
+	SpeedText          string            `json:"speedText,omitempty"`
+	ETAText            string            `json:"etaText,omitempty"`
 	LastError          string            `json:"lastError,omitempty"`
 }
