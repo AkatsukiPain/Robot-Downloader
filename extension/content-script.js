@@ -20,6 +20,9 @@
     return host === "youtube.com" || host.endsWith(".youtube.com") || host === "youtu.be";
   }
 
+  let dragOffsetX = 0, dragOffsetY = 0;
+  let userOffsetX = 0, userOffsetY = 0;
+
   function getOrCreateWrapper() {
     let wrapper = document.getElementById(WRAPPER_ID);
     if (wrapper) return wrapper;
@@ -33,6 +36,28 @@
       pointerEvents: "auto",
       userSelect: "none",
       whiteSpace: "nowrap",
+      fontFamily: "Arial, sans-serif",
+      cursor: "grab",
+      borderRadius: "999px",
+      background: "rgba(30,64,175,0.95)",
+      border: "1px solid rgba(255,255,255,0.18)",
+      boxShadow: "0 10px 25px rgba(15,23,42,0.35)",
+      backdropFilter: "blur(6px)",
+      overflow: "hidden",
+      lineHeight: "normal",
+    });
+
+    // Drag handle
+    const dragHandle = document.createElement("span");
+    dragHandle.textContent = "⠿";
+    Object.assign(dragHandle.style, {
+      display: "inline-block",
+      padding: "6px 4px 6px 8px",
+      color: "rgba(255,255,255,0.6)",
+      fontSize: "14px",
+      cursor: "grab",
+      verticalAlign: "middle",
+      lineHeight: "normal",
     });
 
     const button = document.createElement("button");
@@ -40,32 +65,30 @@
     button.type = "button";
     button.textContent = "Download";
     Object.assign(button.style, {
-      padding: "6px 12px",
-      borderRadius: "999px 0 0 999px",
-      border: "1px solid rgba(255,255,255,0.18)",
-      borderRight: "none",
-      background: "rgba(37,99,235,0.95)",
+      padding: "6px 6px",
+      border: "none",
+      borderRight: "1px solid rgba(255,255,255,0.15)",
+      background: "transparent",
       color: "#fff",
       fontSize: "12px",
       fontWeight: "600",
       cursor: "pointer",
-      boxShadow: "0 10px 25px rgba(15,23,42,0.35)",
-      backdropFilter: "blur(6px)",
-      verticalAlign: "top",
+      verticalAlign: "middle",
       lineHeight: "normal",
       whiteSpace: "nowrap",
+      outline: "none",
     });
 
     const qualitySelect = document.createElement("select");
     qualitySelect.id = QUALITY_ID;
     const qualityOptions = [
-      { value: "highest", label: "Auto (best)" },
-      { value: "2160p", label: "Up to 2160p" },
-      { value: "1440p", label: "Up to 1440p" },
-      { value: "1080p", label: "Up to 1080p" },
-      { value: "720p", label: "Up to 720p" },
-      { value: "480p", label: "Up to 480p" },
-      { value: "360p", label: "Up to 360p" },
+      { value: "highest", label: "Auto" },
+      { value: "2160p", label: "2160p" },
+      { value: "1440p", label: "1440p" },
+      { value: "1080p", label: "1080p" },
+      { value: "720p", label: "720p" },
+      { value: "480p", label: "480p" },
+      { value: "360p", label: "360p" },
     ];
     for (const opt of qualityOptions) {
       const el = document.createElement("option");
@@ -74,27 +97,69 @@
       qualitySelect.appendChild(el);
     }
     Object.assign(qualitySelect.style, {
-      padding: "6px 4px 6px 8px",
-      borderRadius: "0 999px 999px 0",
-      border: "1px solid rgba(255,255,255,0.18)",
-      background: "rgba(30,64,175,0.9)",
+      padding: "6px 4px 6px 6px",
+      border: "none",
+      background: "transparent",
       color: "#fff",
       fontSize: "11px",
       fontWeight: "500",
       cursor: "pointer",
       outline: "none",
-      backdropFilter: "blur(6px)",
-      boxShadow: "0 10px 25px rgba(15,23,42,0.35)",
-      verticalAlign: "top",
+      verticalAlign: "middle",
       lineHeight: "normal",
       appearance: "none",
       WebkitAppearance: "none",
       MozAppearance: "none",
-      textAlignLast: "center",
     });
 
+    wrapper.appendChild(dragHandle);
     wrapper.appendChild(button);
     wrapper.appendChild(qualitySelect);
+
+    // --- Drag support ---
+    let dragging = false;
+    const startDrag = (event) => {
+      if (event.button !== 0) return;
+      // Ignore if clicking on button or select
+      const target = event.target;
+      if (target === button || target === qualitySelect || target.tagName === "OPTION") return;
+      dragging = true;
+      wrapper.style.cursor = "grabbing";
+      const rect = wrapper.getBoundingClientRect();
+      dragOffsetX = event.clientX - rect.left;
+      dragOffsetY = event.clientY - rect.top;
+      event.preventDefault();
+    };
+
+    const onDrag = (event) => {
+      if (!dragging) return;
+      userOffsetX = event.clientX - dragOffsetX;
+      userOffsetY = event.clientY - dragOffsetY;
+      wrapper.style.left = `${userOffsetX}px`;
+      wrapper.style.top = `${userOffsetY}px`;
+      wrapper.style.bottom = "auto";
+      wrapper.style.right = "auto";
+    };
+
+    const stopDrag = () => {
+      if (dragging) {
+        dragging = false;
+        wrapper.style.cursor = "grab";
+      }
+    };
+
+    dragHandle.addEventListener("pointerdown", startDrag);
+    wrapper.addEventListener("pointerdown", (event) => {
+      if (event.target === dragHandle) return;
+      // Still allow dragging from the wrapper background
+      const target = event.target;
+      if (target === button || target === qualitySelect || target.tagName === "OPTION") return;
+      startDrag(event);
+    });
+
+    document.addEventListener("pointermove", onDrag);
+    document.addEventListener("pointerup", stopDrag);
+    document.addEventListener("pointercancel", stopDrag);
 
     const handleQueue = async (event) => {
       event.preventDefault();
@@ -194,10 +259,13 @@
   function positionButton(video) {
     const wrapper = getOrCreateWrapper();
     const rect = video.getBoundingClientRect();
-    const top = Math.max(8, rect.top + 8);
-    const left = Math.max(8, rect.left + 8);
-    wrapper.style.top = `${top}px`;
-    wrapper.style.left = `${left}px`;
+    // Only auto-position if user hasn't dragged it
+    if (userOffsetX === 0 && userOffsetY === 0) {
+      const top = Math.max(8, rect.top + 8);
+      const left = Math.max(8, rect.left + 8);
+      wrapper.style.top = `${top}px`;
+      wrapper.style.left = `${left}px`;
+    }
     wrapper.style.display = rect.width > 120 && rect.height > 80 ? "block" : "none";
   }
 
@@ -257,13 +325,13 @@
       const qualitySelect = document.createElement("select");
       qualitySelect.id = "robot-downloader-yt-quality";
       const qualityOptions = [
-        { value: "highest", label: "Auto (best)" },
-        { value: "2160p", label: "Up to 2160p" },
-        { value: "1440p", label: "Up to 1440p" },
-        { value: "1080p", label: "Up to 1080p" },
-        { value: "720p", label: "Up to 720p" },
-        { value: "480p", label: "Up to 480p" },
-        { value: "360p", label: "Up to 360p" },
+        { value: "highest", label: "Auto" },
+        { value: "2160p", label: "2160p" },
+        { value: "1440p", label: "1440p" },
+        { value: "1080p", label: "1080p" },
+        { value: "720p", label: "720p" },
+        { value: "480p", label: "480p" },
+        { value: "360p", label: "360p" },
       ];
       for (const opt of qualityOptions) {
         const el = document.createElement("option");
@@ -341,12 +409,10 @@
   function attach(video) {
     if (!(video instanceof HTMLVideoElement) || video.dataset.robotDownloaderBound === "1") return;
     video.dataset.robotDownloaderBound = "1";
-    // Just mark it, we'll pick the best video to show on
   }
 
   function pickVideo() {
     const videos = document.querySelectorAll("video");
-    // Pick the largest visible video
     let best = null;
     let bestArea = 0;
     for (const v of videos) {
@@ -364,7 +430,6 @@
     const video = pickVideo();
     if (video) {
       showForVideo(video);
-      // Also reposition on scroll/resize
     } else {
       hideButton();
     }
@@ -376,7 +441,6 @@
     updateButton();
   }
 
-  // Re-position on scroll/resize
   window.addEventListener("scroll", () => {
     if (activeVideo) positionButton(activeVideo);
   }, true);
@@ -384,12 +448,10 @@
     if (activeVideo) positionButton(activeVideo);
   });
 
-  // Watch for new videos
   const observer = new MutationObserver(() => {
     scan();
   });
   observer.observe(document.documentElement, { childList: true, subtree: true });
 
-  // Initial scan
   scan();
 })();
